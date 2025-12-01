@@ -16,9 +16,10 @@ from sklearn.metrics import (accuracy_score, classification_report, confusion_ma
                              precision_recall_curve, precision_score, r2_score, recall_score,
                              roc_auc_score, roc_curve)
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder, PolynomialFeatures, StandardScaler
 
 from Scripts.tooltips import Tooltip
+from Scripts.generator import launch_generator_window
 
 matplotlib.use("TkAgg")
 matplotlib.rcParams.update(
@@ -35,7 +36,13 @@ class RegressionToolApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("Regression Tool")
-        self.root.geometry("1200x750")
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        window_w = int(screen_w * 0.85)
+        window_h = int(screen_h * 0.85)
+        self.root.geometry(f"{window_w}x{window_h}")
+        self.root.minsize(int(screen_w * 0.6), int(screen_h * 0.6))
+        self.left_panel_width = max(480, int(window_w * 0.33))
 
         self.df: pd.DataFrame | None = None
         self.model = None
@@ -62,6 +69,7 @@ class RegressionToolApp:
         self.sample_var = tk.StringVar(value="")
         self.cv_folds_var = tk.StringVar(value="0")
         self.standardize_var = tk.BooleanVar(value=True)
+        self.skip_first_row_var = tk.BooleanVar(value=False)
         self.test_size_var.trace_add("write", lambda *_: self._update_train_test_info())
         self.random_state_var.trace_add("write", lambda *_: self._update_train_test_info())
 
@@ -76,6 +84,7 @@ class RegressionToolApp:
         self.metrics_text: tk.Text | None = None
         self.progress_var = tk.DoubleVar(value=0.0)
         self.colorbar = None
+        self.feature_transformer = None
 
         self._build_layout()
         self.root.bind("<Left>", lambda event: self._shift_feature(-1))
@@ -101,7 +110,7 @@ class RegressionToolApp:
             self.btn_predict.configure(state=predict_state)
 
     def _build_layout(self) -> None:
-        self.root.columnconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1, minsize=self.left_panel_width)
         self.root.columnconfigure(1, weight=2)
         self.root.rowconfigure(0, weight=1)
 
@@ -116,9 +125,12 @@ class RegressionToolApp:
         left_canvas.configure(yscrollcommand=left_scrollbar.set)
         left = tk.Frame(left_canvas, padx=10, pady=10)
         left_canvas.create_window((0, 0), window=left, anchor="nw")
-        left.bind(
-            "<Configure>", lambda _event: left_canvas.configure(scrollregion=left_canvas.bbox("all"), width=430)
-        )
+        def _sync_left_width(_event=None) -> None:
+            target_width = max(self.left_panel_width, left_container.winfo_width())
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"), width=target_width)
+        left.bind("<Configure>", _sync_left_width)
+        left_container.bind("<Configure>", _sync_left_width)
+        _sync_left_width()
         left.columnconfigure(0, weight=1)
 
         right = tk.Frame(self.root, padx=10, pady=10)
@@ -145,6 +157,10 @@ class RegressionToolApp:
         tk.Button(frame, text="Browse", command=self.browse_dataset).grid(row=0, column=2, padx=4)
         tk.Button(frame, text="Load", command=self.load_dataset).grid(row=0, column=3, padx=4)
         self._attach_tooltip(dataset_entry, "Path to CSV (use files under Data/)")
+        tk.Button(frame, text="Generate dataset", command=self.open_generator).grid(row=0, column=4, padx=4)
+        tk.Checkbutton(frame, text="Ignore first row", variable=self.skip_first_row_var).grid(
+            row=1, column=1, sticky="w", pady=4
+        )
 
         tk.Label(frame, text="Model type:").grid(row=1, column=0, sticky="w", pady=4)
         model_options = [
@@ -153,6 +169,11 @@ class RegressionToolApp:
             "Ridge Regression",
             "Lasso Regression",
             "Random Forest Regression",
+            "Quadratic Regression",
+            "Cubic Regression",
+            "Logarithmic Regression",
+            "Exponential Regression",
+            "Trigonometric Regression",
         ]
         model_cb = ttk.Combobox(frame, textvariable=self.model_var, values=model_options, state="readonly")
         model_cb.grid(row=1, column=1, sticky="ew", padx=4)
@@ -351,7 +372,8 @@ class RegressionToolApp:
             messagebox.showerror("Dataset", f"Dataset not found: {path}")
             return
         try:
-            self.df = pd.read_csv(path)
+            skip_rows = 1 if self.skip_first_row_var.get() else 0
+            self.df = pd.read_csv(path, skiprows=skip_rows)
         except Exception as exc:
             messagebox.showerror("Dataset", f"Could not load dataset: {exc}")
             return
@@ -372,6 +394,7 @@ class RegressionToolApp:
         self.training_history = []
         self.model = None
         self.progress_var.set(0)
+        self.feature_transformer = None
         self._update_graph(self.available_features, None, None)
         self._update_dataset_info()
         self._update_train_test_info()
@@ -465,12 +488,45 @@ class RegressionToolApp:
 
         return X, y, features
 
-    def _transform_features(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+    def _model_specific_transform(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        model_type = self.model_var.get()
+        if model_type in ("Quadratic Regression", "Cubic Regression"):
+            degree = 2 if model_type == "Quadratic Regression" else 3
+            if (
+                self.feature_transformer is None
+                or not isinstance(self.feature_transformer, PolynomialFeatures)
+                or getattr(self.feature_transformer, "degree", None) != degree
+            ):
+                transformer = PolynomialFeatures(degree=degree, include_bias=False)
+                if fit:
+                    X_transformed = transformer.fit_transform(X)
+                    self.feature_transformer = transformer
+                else:
+                    X_transformed = transformer.fit_transform(X)
+                    self.feature_transformer = transformer
+            else:
+                X_transformed = self.feature_transformer.transform(X)
+            return X_transformed.astype(float)
+        self.feature_transformer = None if model_type not in ("Quadratic Regression", "Cubic Regression") else self.feature_transformer
+        if model_type == "Logarithmic Regression":
+            return (np.sign(X) * np.log1p(np.abs(X))).astype(float)
+        if model_type == "Exponential Regression":
+            return np.exp(np.clip(X, -5, 5)).astype(float)
+        if model_type == "Trigonometric Regression":
+            sin_part = np.sin(X)
+            cos_part = np.cos(X)
+            return np.concatenate([sin_part, cos_part], axis=1).astype(float)
+        return X.astype(float)
+
+    def _pipeline_transform(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        X_t = self._model_specific_transform(X, fit=fit)
         if not self.standardize_var.get():
-            return X
+            if fit:
+                self.scaler = StandardScaler()
+            return X_t
         if fit:
-            self.scaler.fit(X)
-        return self.scaler.transform(X)
+            self.scaler.fit(X_t)
+        return self.scaler.transform(X_t)
 
     def _update_training_plot(self, axis=None) -> None:
         ax = axis or self.ax_loss
@@ -507,7 +563,7 @@ class RegressionToolApp:
             messagebox.showerror("Training", str(exc))
             return
 
-        X_scaled = self._transform_features(X, fit=True)
+        X_scaled = self._pipeline_transform(X, fit=True)
         model_type = self.model_var.get()
         self.training_history = []
         self.progress_var.set(0)
@@ -515,7 +571,16 @@ class RegressionToolApp:
         self.last_eval = None
 
         try:
-            if model_type in ("Linear Regression", "Ridge Regression", "Lasso Regression"):
+            if model_type in (
+                "Linear Regression",
+                "Ridge Regression",
+                "Lasso Regression",
+                "Quadratic Regression",
+                "Cubic Regression",
+                "Logarithmic Regression",
+                "Exponential Regression",
+                "Trigonometric Regression",
+            ):
                 penalty = "l2" if model_type != "Lasso Regression" else "l1"
                 adjusted_alpha = alpha if model_type != "Linear Regression" else max(alpha * 0.1, 1e-6)
                 model = SGDRegressor(
@@ -595,9 +660,9 @@ class RegressionToolApp:
             return
 
         try:
-            X_scaled = self._transform_features(X, fit=False)
+            X_scaled = self._pipeline_transform(X, fit=False)
         except Exception:
-            X_scaled = self._transform_features(X, fit=True)
+            X_scaled = self._pipeline_transform(X, fit=True)
 
         stratify = y if self.task_type == "classification" else None
         try:
@@ -693,9 +758,9 @@ class RegressionToolApp:
             return
 
         try:
-            sample_scaled = self._transform_features(np.array([values]), fit=False)
+            sample_scaled = self._pipeline_transform(np.array([values]), fit=False)
         except Exception:
-            sample_scaled = self._transform_features(np.array([values]), fit=True)
+            sample_scaled = self._pipeline_transform(np.array([values]), fit=True)
         try:
             pred = self.model.predict(sample_scaled)
         except Exception as exc:
@@ -736,8 +801,8 @@ class RegressionToolApp:
                 X, y, test_size=test_size, random_state=random_state
             )
 
-        X_train_scaled = self._transform_features(X_train, fit=True)
-        X_val_scaled = self._transform_features(X_val, fit=False)
+        X_train_scaled = self._pipeline_transform(X_train, fit=True)
+        X_val_scaled = self._pipeline_transform(X_val, fit=False)
 
         model_type = self.model_var.get()
         best_loss = float("inf")
@@ -821,6 +886,8 @@ class RegressionToolApp:
         rf = model_type == "Random Forest Regression"
         state_rf = tk.NORMAL if rf else tk.DISABLED
         state_sgd = tk.NORMAL if not rf else tk.DISABLED
+        # reset transformer when model type changes
+        self.feature_transformer = None
         for widget in (
             self.entry_estimators,
             self.entry_depth,
@@ -890,11 +957,7 @@ class RegressionToolApp:
                     line_features = np.tile(base, (len(xs), 1))
                     line_features[:, feature_idx] = xs
                     try:
-                        transformed = (
-                            self._transform_features(line_features, fit=False)
-                            if self.standardize_var.get()
-                            else line_features
-                        )
+                        transformed = self._pipeline_transform(line_features, fit=False)
                         preds = self.model.predict(transformed)
                         if self.task_type == "classification" and hasattr(self.model, "predict_proba"):
                             prob = self.model.predict_proba(transformed)
@@ -1110,12 +1173,30 @@ class RegressionToolApp:
 
                 estimator = Pipeline([("scaler", StandardScaler()), ("model", estimator)])
 
+            # apply model-specific transform for CV without altering main transformer
+            def transform_for_cv(X_in: np.ndarray) -> np.ndarray:
+                mt = self.model_var.get()
+                if mt in ("Quadratic Regression", "Cubic Regression"):
+                    degree = 2 if mt == "Quadratic Regression" else 3
+                    transformer = PolynomialFeatures(degree=degree, include_bias=False)
+                    return transformer.fit_transform(X_in)
+                if mt == "Logarithmic Regression":
+                    return (np.sign(X_in) * np.log1p(np.abs(X_in))).astype(float)
+                if mt == "Exponential Regression":
+                    return np.exp(np.clip(X_in, -5, 5)).astype(float)
+                if mt == "Trigonometric Regression":
+                    sin_part = np.sin(X_in)
+                    cos_part = np.cos(X_in)
+                    return np.concatenate([sin_part, cos_part], axis=1).astype(float)
+                return X_in.astype(float)
+
+            X_cv = transform_for_cv(X)
             if self.task_type == "classification":
                 cv = StratifiedKFold(folds, shuffle=True, random_state=random_state)
-                scores = cross_val_score(estimator, X, y, cv=cv, scoring="accuracy")
+                scores = cross_val_score(estimator, X_cv, y, cv=cv, scoring="accuracy")
                 return f"CV Accuracy: {np.mean(scores):.3f} ± {np.std(scores):.3f}"
             cv = KFold(folds, shuffle=True, random_state=random_state)
-            scores = cross_val_score(estimator, X, y, cv=cv, scoring="neg_mean_squared_error")
+            scores = cross_val_score(estimator, X_cv, y, cv=cv, scoring="neg_mean_squared_error")
             scores = -scores
             return f"CV MSE: {np.mean(scores):.3f} ± {np.std(scores):.3f}"
         except Exception as exc:
@@ -1200,6 +1281,12 @@ class RegressionToolApp:
         except Exception as exc:
             messagebox.showerror("Load session", f"Could not load session: {exc}")
 
+    def open_generator(self) -> None:
+        try:
+            launch_generator_window(self.root, os.path.join(os.getcwd(), "Data"))
+        except Exception as exc:
+            messagebox.showerror("Generator", f"Could not open generator: {exc}")
+
     def save_model(self) -> None:
         if self.model is None:
             messagebox.showinfo("Save model", "No trained model to save.")
@@ -1221,6 +1308,7 @@ class RegressionToolApp:
             "target": self.target_var.get(),
             "features": self._get_selected_features(),
             "standardize": self.standardize_var.get(),
+            "feature_transformer": self.feature_transformer,
         }
         try:
             joblib.dump(bundle, file_path)
@@ -1244,6 +1332,7 @@ class RegressionToolApp:
             self.model_var.set(bundle.get("model_type", self.model_var.get()))
             self.target_var.set(bundle.get("target", self.target_var.get()))
             self.standardize_var.set(bundle.get("standardize", self.standardize_var.get()))
+            self.feature_transformer = bundle.get("feature_transformer")
             self.status_var.set(f"Loaded model from {file_path}")
             self.training_history = []
             self._toggle_param_visibility()

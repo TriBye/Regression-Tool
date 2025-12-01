@@ -6,3 +6,8 @@ Supported model types:
 - Lasso Regression
 - Logistic Regression (classification)
 - Random Forest Regression
+- Quadratic Regression
+- Cubic Regression
+- Logarithmic Regression
+- Exponential Regression
+- Trigonometric Regression
